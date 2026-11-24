@@ -1,0 +1,555 @@
+
+name: Build Minecraft Bedrock Add-on Reference EPUB
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"
+  push:
+    paths:
+      - ".github/workflows/build-epub.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: minecraft-epub-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Collect documentation and build EPUB
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout ebook builder fork
+        uses: actions/checkout@v6
+        with:
+          path: builder
+
+      - name: Checkout official Minecraft documentation
+        uses: actions/checkout@v6
+        with:
+          repository: MicrosoftDocs/minecraft-creator
+          ref: main
+          path: minecraft-creator
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc epubcheck
+          python -m pip install --upgrade pip
+          python -m pip install PyYAML
+
+      - name: Collect documentation and build EPUB
+        working-directory: builder
+        shell: bash
+        run: |
+          cat > build_epub.py <<'PYTHON'
+          import os
+          import re
+          import sys
+          import yaml
+          import shutil
+          import hashlib
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          ROOT = Path("../minecraft-creator").resolve()
+          CREATOR = ROOT / "creator"
+          BUILD = Path("epub-build").resolve()
+          TEMP = BUILD / "markdown"
+          OUTPUT = Path("Minecraft_Bedrock_Addon_Complete_Reference.epub").resolve()
+
+          BUILD.mkdir(exist_ok=True)
+          TEMP.mkdir(exist_ok=True)
+
+          collected = []
+          visited_tocs = set()
+          skipped = []
+          remote_images = set()
+
+          def resolve_source(value, parent):
+              value = value.split("#")[0].split("?")[0].strip()
+
+              if not value or value.startswith(("http:", "https:", "mailto:", "//")):
+                  return None
+
+              value = value.lstrip("/")
+              candidates = [
+                  parent / value,
+                  CREATOR / value,
+                  ROOT / value
+              ]
+
+              for candidate in candidates:
+                  try:
+                      candidate = candidate.resolve()
+                      if candidate.is_file() and candidate.is_relative_to(CREATOR):
+                          return candidate
+                  except (OSError, ValueError):
+                      pass
+
+              return None
+
+          def relevant(path):
+              rel = path.relative_to(CREATOR).as_posix()
+
+              if not (
+                  rel.startswith("Documents/")
+                  or rel.startswith("Reference/Content/")
+                  or rel.startswith("ScriptAPI/")
+                  or rel == "Reference/index.yml"
+              ):
+                  return False
+
+              excluded = [
+                  "ContributorGuide",
+                  "StyleGuide",
+                  "TipsForUsingThisSite",
+                  "Update1.",
+                  "MinecraftLive",
+                  "News"
+              ]
+
+              if any(x in path.name for x in excluded):
+                  return False
+
+              return True
+
+          def walk_yaml(path):
+              path = path.resolve()
+
+              if path in visited_tocs:
+                  return
+
+              visited_tocs.add(path)
+
+              try:
+                  data = yaml.safe_load(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  skipped.append((str(path), str(exc)))
+                  return
+
+              def inspect(value):
+                  if isinstance(value, dict):
+                      for key, child in value.items():
+                          if key in ("href", "url") and isinstance(child, str):
+                              target = resolve_source(child, path.parent)
+
+                              if target:
+                                  if target.suffix.lower() == ".yml":
+                                      walk_yaml(target)
+                                  elif target.suffix.lower() == ".md":
+                                      add_page(target)
+
+                          else:
+                              inspect(child)
+
+                  elif isinstance(value, list):
+                      for child in value:
+                          inspect(child)
+
+              inspect(data)
+
+          def add_page(path):
+              path = path.resolve()
+
+              if path in collected:
+                  return
+
+              if not relevant(path):
+                  return
+
+              rel = path.relative_to(CREATOR).as_posix().lower()
+
+              # Avoid explicitly separated preview-only directories/files.
+              if any(x in rel for x in (
+                  "/experimental/",
+                  "/preview/",
+                  "/beta/"
+              )):
+                  return
+
+              if rel.endswith(("-beta.md", "-preview.md")):
+                  return
+
+              collected.append(path)
+
+          toc = CREATOR / "TOC.yml"
+
+          if not toc.exists():
+              raise SystemExit("Official creator TOC was not found.")
+
+          print("Auditing main documentation TOC...")
+          walk_yaml(toc)
+
+          # The Script API reference is a major documentation section
+          # and must not depend solely on the main learning TOC.
+          api = CREATOR / "ScriptAPI"
+
+          if api.exists():
+              print("Collecting Script API reference...")
+              for path in sorted(api.rglob("*.md")):
+                  add_page(path)
+
+          # Include the central reference index.
+          index = CREATOR / "Reference" / "index.yml"
+          if index.exists():
+              walk_yaml(index)
+
+          if not collected:
+              raise SystemExit("No relevant documentation pages were collected.")
+
+          print(f"Collected {len(collected)} documentation pages.")
+
+          def clean_frontmatter(content):
+              return re.sub(
+                  r"\A---\s*\n.*?\n---\s*\n",
+                  "",
+                  content,
+                  count=1,
+                  flags=re.DOTALL
+              )
+
+          def fix_images(content, source):
+              pattern = re.compile(
+                  r"(!\[[^\]]*\]\()([^)]+)(\))"
+              )
+
+              def replace(match):
+                  url = match.group(2).strip()
+
+                  if url.startswith(("http://", "https://", "data:")):
+                      if url.startswith(("http://", "https://")):
+                          remote_images.add(url)
+                      return match.group(0)
+
+                  image_path = resolve_source(url, source.parent)
+
+                  if image_path:
+                      return (
+                          match.group(1)
+                          + image_path.as_posix()
+                          + match.group(3)
+                      )
+
+                  return match.group(0)
+
+              return pattern.sub(replace, content)
+
+          def extract_title(content, fallback):
+              match = re.search(r"^#\s+(.+?)\s*#*\s*$", content, re.MULTILINE)
+              if match:
+                  return match.group(1).strip()
+              return fallback
+
+          # Create a source manifest for reproducibility.
+          source_manifest = []
+
+          for i, source in enumerate(collected, 1):
+              rel = source.relative_to(CREATOR).as_posix()
+
+              content = source.read_text(
+                  encoding="utf-8",
+                  errors="replace"
+              )
+
+              content = clean_frontmatter(content)
+              content = fix_images(content, source)
+
+              title = extract_title(content, source.stem)
+
+              source_manifest.append({
+                  "path": rel,
+                  "title": title,
+                  "sha256": hashlib.sha256(
+                      source.read_bytes()
+                  ).hexdigest()
+              })
+
+              target = TEMP / f"{i:05d}.md"
+
+              target.write_text(
+                  content,
+                  encoding="utf-8"
+              )
+
+          # Add attribution and retrieval information.
+          date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+          attribution = TEMP / "00000-attribution.md"
+
+          attribution.write_text(
+              f"""# About This Reference Book
+
+          **Title:** Minecraft Bedrock Add-on Complete Reference
+
+          **Documentation retrieval date:** {date}
+
+          **Primary source:** Microsoft Minecraft Creator Documentation
+
+          https://learn.microsoft.com/en-us/minecraft/creator/
+
+          **Source repository:**
+          https://github.com/MicrosoftDocs/minecraft-creator
+
+          The source documentation is published under the licensing
+          terms specified by its original authors and repository.
+          The MicrosoftDocs/minecraft-creator repository identifies
+          CC-BY-4.0 and MIT licensing.
+
+          This ebook is an independently generated compilation.
+          Individual documents retain their original authorship,
+          technical content and attribution where supplied.
+
+          This is not an official Microsoft publication.
+
+          ## Collection statistics
+
+          - Documentation pages collected: {len(collected)}
+          - Documentation retrieval date: {date}
+          - Preview-only directories excluded by path: yes
+          - Script API reference collection: included
+
+          Some preview APIs may still be documented inside otherwise
+          stable reference pages. Consult the original documentation
+          for the compatibility status of individual APIs.
+
+          ## Source manifest
+
+          See the accompanying build audit artifact for individual
+          source paths and checksums.
+          """,
+              encoding="utf-8"
+          )
+
+          # Build a readable stylesheet.
+          css = BUILD / "epub.css"
+
+          css.write_text("""
+          body {
+              font-family: serif;
+              line-height: 1.65;
+              margin: 5%;
+          }
+
+          h1, h2, h3, h4, h5 {
+              font-family: sans-serif;
+              line-height: 1.25;
+              page-break-after: avoid;
+          }
+
+          h1 {
+              font-size: 2em;
+              border-bottom: 1px solid #888;
+              padding-bottom: 0.35em;
+          }
+
+          h2 {
+              font-size: 1.5em;
+          }
+
+          p, li {
+              orphans: 2;
+              widows: 2;
+          }
+
+          pre, pre.sourceCode {
+              background: #1e1e1e !important;
+              color: #d4d4d4 !important;
+              padding: 1em;
+              border-radius: 5px;
+              white-space: pre-wrap;
+              overflow-wrap: anywhere;
+              font-family: monospace !important;
+              font-size: 0.82em;
+              line-height: 1.45;
+          }
+
+          code, code span {
+              font-family: monospace !important;
+          }
+
+          p code, li code {
+              background: #292929;
+              color: #ce9178;
+              padding: 0.12em 0.3em;
+              border-radius: 3px;
+          }
+
+          pre code {
+              background: transparent !important;
+              color: inherit !important;
+              padding: 0;
+          }
+
+          table {
+              border-collapse: collapse;
+              width: 100%;
+              font-size: 0.85em;
+              margin: 1em 0;
+          }
+
+          th, td {
+              border: 1px solid #888;
+              padding: 0.5em;
+              vertical-align: top;
+          }
+
+          th {
+              background: #333;
+              color: white;
+          }
+
+          blockquote {
+              border-left: 3px solid #888;
+              padding-left: 1em;
+              margin-left: 0;
+          }
+
+          img {
+              max-width: 100%;
+              height: auto;
+          }
+
+          a {
+              overflow-wrap: anywhere;
+          }
+
+          .sourceCode .kw { color: #569cd6; }
+          .sourceCode .st { color: #ce9178; }
+          .sourceCode .dv { color: #b5cea8; }
+          .sourceCode .fl { color: #b5cea8; }
+          .sourceCode .co { color: #6a9955; }
+          .sourceCode .fu { color: #dcdcaa; }
+          .sourceCode .dt { color: #4ec9b0; }
+          .sourceCode .va { color: #9cdcfe; }
+          .sourceCode .op { color: #d4d4d4; }
+          .sourceCode .bu { color: #569cd6; }
+          .sourceCode .cf { color: #c586c0; }
+
+          @media (prefers-color-scheme: dark) {
+              body { color: #e0e0e0; }
+          }
+          """, encoding="utf-8")
+
+          # Preserve the order in the official TOC.
+          inputs = [str(attribution)]
+          inputs += [
+              str(TEMP / f"{i:05d}.md")
+              for i in range(1, len(collected) + 1)
+          ]
+
+          print("Generating EPUB 3...")
+
+          import subprocess
+
+          command = [
+              "pandoc",
+              *inputs,
+              "-o", str(OUTPUT),
+              "--from=markdown+fenced_code_blocks+pipe_tables+yaml_metadata_block+raw_html",
+              "--to=epub3",
+              "--standalone",
+              "--toc",
+              "--toc-depth=4",
+              "--epub-chapter-level=1",
+              "--highlight-style=espresso",
+              "--css", str(css),
+              "--metadata", "title=Minecraft Bedrock Add-on Complete Reference",
+              "--metadata", "author=Community Documentation Compilation",
+              "--metadata", "lang=en-US",
+              "--metadata", "publisher=Independent Technical Reference",
+              "--metadata", f"date={date}",
+              "--resource-path=.:../minecraft-creator:../minecraft-creator/creator",
+              "--split-level=1"
+          ]
+
+          subprocess.run(command, check=True)
+
+          if not OUTPUT.exists() or OUTPUT.stat().st_size < 10000:
+              raise SystemExit("EPUB generation failed or produced an invalidly small file.")
+
+          # Save the audit report.
+          report = BUILD / "build-report.md"
+
+          report.write_text(
+              f"""# Minecraft Bedrock Add-on Reference Build Report
+
+          - Retrieval date: {date}
+          - Source: MicrosoftDocs/minecraft-creator
+          - Pages collected: {len(collected)}
+          - EPUB size: {OUTPUT.stat().st_size:,} bytes
+          - Remote image references remaining: {len(remote_images)}
+          - YAML collection errors: {len(skipped)}
+
+          ## Collected source files
+
+          """ + "\n".join(
+              f"- `{x['path']}` — {x['title']}"
+              for x in source_manifest
+          ) + "\n\n## Collection errors\n\n" + "\n".join(
+              f"- {p}: {e}" for p, e in skipped
+          ) + "\n",
+              encoding="utf-8"
+          )
+
+          import json
+
+          (BUILD / "source-manifest.json").write_text(
+              json.dumps(source_manifest, indent=2),
+              encoding="utf-8"
+          )
+
+          (BUILD / "remote-images.txt").write_text(
+              "\n".join(sorted(remote_images)),
+              encoding="utf-8"
+          )
+
+          shutil.copy2(
+              OUTPUT,
+              Path("Minecraft_Bedrock_Addon_Complete_Reference.epub")
+          )
+
+          print("EPUB build completed.")
+          print(f"Pages: {len(collected)}")
+          print(f"Size: {OUTPUT.stat().st_size:,} bytes")
+          print(f"Remote image references: {len(remote_images)}")
+          PYTHON
+
+          python build_epub.py
+
+      - name: Validate EPUB with EPUBCheck
+        working-directory: builder
+        run: |
+          epubcheck Minecraft_Bedrock_Addon_Complete_Reference.epub
+
+      - name: Upload finished EPUB
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          name: Minecraft-Bedrock-Addon-Complete-Reference
+          path: builder/Minecraft_Bedrock_Addon_Complete_Reference.epub
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Upload build audit
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: Minecraft-Documentation-Build-Audit
+          path: |
+            builder/epub-build/build-report.md
+            builder/epub-build/source-manifest.json
+            builder/epub-build/remote-images.txt
+          if-no-files-found: warn
+          retention-days: 90
